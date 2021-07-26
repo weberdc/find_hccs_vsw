@@ -4,7 +4,9 @@ import csv
 import gzip
 import json
 import networkx as nx
+import re
 import sys
+import time
 import utils
 
 from argparse import ArgumentParser
@@ -40,16 +42,9 @@ class Options:
         )
         self.parser.add_argument(
             '-d2',
-            required=True,
+            default='-1',
             dest='d2_arg',
-            help='Delta 2 window size, value + unit, e.g. 10s = 10 seconds (m=mins, h=hr, d=day, w=week)'
-        )
-        self.parser.add_argument(
-            '--mode',
-            dest='process_mode',
-            choices=['BATCH', 'STREAM'],
-            default='BATCH',
-            help='Processing mode, batch or stream (default: BATCH)'
+            help='Delta 2 window size, value + unit, e.g. 10s = 10 seconds (m=mins, h=hr, d=day, w=week) (default: same as delta 1)'
         )
         self.parser.add_argument(
             '--raw',
@@ -84,11 +79,30 @@ class Options:
             help='Name of target column, i.e., value binding coordinating accounts (default: target)'
         )
         self.parser.add_argument(
+            '--id-col',
+            default='t_id',
+            dest='id_column',
+            help='Name of post ID column, (default: t_id)'
+        )
+        self.parser.add_argument(
+            '--exclude-targets',
+            default='',
+            dest='exclude_targets',
+            help='Target values to ignore, separated by | (default: "")'
+        )
+        self.parser.add_argument(
             '--dry-run',
             dest='dry_run',
             action='store_true',
             default=False,
             help='Dry run - will not write to disk (default: False)'
+        )
+        self.parser.add_argument(
+            '--final-g-only',
+            dest='final_g_only',
+            action='store_true',
+            default=False,
+            help='Will only write out final combined CN (default: False)'
         )
         self.parser.add_argument(
             '-v', '--verbose',
@@ -102,135 +116,45 @@ class Options:
         return self.parser.parse_args(args)
 
 
-class Detector:
-
-    def __init__(self, d1, d2):
-        self.d1 = d1
-        self.d2 = d2
-        if d1 > d2:
-            print(f'{d1=} can\'t be greater than {d2=}.')
-            sys.exit(-1)
-
-    def process(self, records, old_g):
-        new_g = old_g #.copy()
-        count = 0
-        for r in records:
-            count += 1
-        # log(f'Processed {count} records')
-        # process records
-        # update old_g to new_g
-        # remove whatever's needed from old_g
-        return new_g
-
-
-
-class StreamConsumer:
-
-    def __init__(**stream_config):
-        this.cfg = { **stream_config }
-
-
-class BatchConsumer2:
-    def __init__(self, d1=10, d2=60, ts_col='timestamp', raw_data=None, extractor=None):
-        """d1=10, d2=60 in seconds"""
-        if d1 > d2:
-            print(f'{d1=} can\'t be greater than {d2=}.')
-            sys.exit(-1)
-        self.d1 = d1
-        self.d2 = d2
-        self.raw_data = raw_data
-        self.extractor = extractor
-        if self.raw_data == 'TWEETS':
-            self.ts_col = 'created_at'
-        else:
-            self.ts_col = ts_col
-
-    def start_processing(self, in_file):
-        if in_file[-1].lower() == 'z':
-            self.in_f = gzip.open(in_file, 'rb')
-        else:
-            self.in_f = open(in_file, 'r', encoding='utf-8')
-        self.queue = []  #
-        self.first_w_ts = -1
-        self.done_reading = False
-        self.next_line = None
-
-    def _parse_ts(self, ts_str):
-        return utils.extract_ts_s(ts_str)
-
-    def _get_next_line(self):
-        for line in self.reader:
-            yield line
-
-    def get_next_batch(self):
-        # set up appropriate reader
-        if self.raw_data: #== 'TWEETS':
-            self.reader = self.in_f
-        else:
-            self.reader = csv.DictReader(self.in_f)
-
-        if not self.next_line:
-            self.next_line = self._get_next_line()
-
-        first_iteration_this_invocation = True
-        if self.raw_data == 'TWEETS':
-            # increment first timestamp in window if not the first post
-            log(f'{self.first_w_ts=}')
-            # not the first call
-            if self.first_w_ts != -1:
-                self.first_w_ts += self.d1
-                # dump posts that are from before the window
-                new_first_idx = 0
-                for post in self.queue:
-                    if post['ts'] < self.first_w_ts:
-                        new_first_idx += 1
-                    else:
-                        break
-                self.queue = self.queue[new_first_idx:]
-
-            while not self.done_reading:
-            # for l in self.in_f:
-                try:
-                    r = next(self.next_line)
-                    if self.raw_data == 'TWEETS':
-                        r = json.loads(r)  # assume posts are in order
-                        curr_ts = self._parse_ts(r[self.ts_col])
-                    else:
-                        curr_ts = int(r[self.ts_col])
-                    # set first timestamp in window and first queue
-                    if self.first_w_ts == -1:
-                        self.first_w_ts = curr_ts
-                    # fill the queue
-                    if curr_ts <= self.first_w_ts + self.d2:
-                        self.queue.append(self.extractor.extract(r))
-                    else:
-                        break
-                except StopIteration:
-                    break
-        return self.queue
-
-
-
-    def finish_processing(self):
-        self.in_f.close()
-
-
 class Extractor:
-    EXTRACTABLES = ['HASHTAGS', 'URLS', 'RETWEETS', 'REPLIES', 'MENTIONS', 'QUOTES', 'TEXT']
-    def __init__(self, what):
-        self.field = what
+    EXTRACTABLES = ['HASHTAGS', 'URLS', 'RETWEETS', 'REPLIES', 'MENTIONS', 'QUOTES', 'TEXT', 'DOMAINS']
+    def __init__(self, exclude_targets):
+        self.to_exclude = exclude_targets
 
     def extract(self, post):
         pass
 
 
+class CsvExtractor(Extractor):
+    def __init__(self, id_col, ts_col, src_col, tgt_col, exclude_targets):
+        super().__init__(exclude_targets)
+        self.ts_col = ts_col
+        self.src_col = src_col
+        self.tgt_col = tgt_col
+        self.id_col = id_col
+
+    def extract(self, row):
+        if row[self.tgt_col] in self.to_exclude:
+            return []
+
+        return [{
+            't_id': row[self.id_col],
+            'ts' :  int(row[self.ts_col]),
+            'src':  row[self.src_col],
+            'tgt':  row[self.tgt_col]
+        }]
+
+
 class TweetExtractor(Extractor):
-    def __init__(self, what):
-        super().__init__(what)
+    # used to avoid catching Twitter URLs and domains
+    TWEET_URL_REGEX = re.compile('https://twitter.com/[^/]*/status/.*')
+
+    def __init__(self, what, exclude_targets):
+        super().__init__(exclude_targets)
+        self.field = what
 
     def extract(self, post):
         # may result in multiple extractions
-        # parse tweet
         t = json.loads(post)
         extractions = []
         extract_template = {
@@ -253,14 +177,28 @@ class TweetExtractor(Extractor):
             extractions.append(extract_template)
         elif self.field == 'HASHTAGS':
             for ht in utils.lowered_hashtags_from(t, include_retweet=True):
+                if ht in self.to_exclude:
+                    continue
                 ht_extract = extract_template.copy()
                 ht_extract['tgt'] = ht
                 extractions.append(ht_extract)
         elif self.field == 'URLS':
             for url in utils.expanded_urls_from(t, include_retweet=True):
+                if TWEET_URL_REGEX.match(url) or url in self.to_exclude:
+                    continue
                 url_extract = extract_template.copy()
                 url_extract['tgt'] = url
                 extractions.append(url_extract)
+        elif self.field == 'DOMAINS':
+            domains = [
+                utils.extract_domain(url) for url in utils.expanded_urls_from(t, include_retweet=True)
+            ]
+            for domain in domains:
+                if domain == 'twitter.com' or domain in self.to_exclude:
+                    continue
+                domain_extract = extract_template.copy()
+                domain_extract['tgt'] = domain
+                extractions.append(domain_extract)
         elif self.field == 'MENTIONS':
             if utils.is_rt(t):
                 # NB this avoids implicit mention of retweeted account
@@ -269,15 +207,13 @@ class TweetExtractor(Extractor):
                 mentions = utils.mentioned_ids_from(t)
 
             for m in mentions:
+                if m in self.to_exclude:
+                    continue
                 m_extract = extract_template.copy()
                 m_extract['tgt'] = m
                 extractions.append(m_extract)
         # return them
         return extractions
-
-
-class BatchConsumer:
-    pass
 
 
 class BatchManager:
@@ -288,7 +224,7 @@ class BatchManager:
 
     def open_file(self, in_file):
         if in_file[-1].lower() == 'z':  # assumes *.gz
-            return gzip.open(in_file, 'rb')
+            return gzip.open(in_file, 'rt')
         else:
             return open(in_file, 'r', encoding='utf-8')
 
@@ -302,7 +238,11 @@ class BatchManager:
             return x == y
 
     def process(self, batch, d1_end_ts, old_g, comparison='EXACT'):
-        new_g = old_g.copy()
+        def check_node(g, n_id):
+            if not g.has_node(n_id):
+                g.add_node(n_id, label=n_id)
+
+        new_g = old_g.copy() if not self.cfg['final_g_only'] else old_g
         for i in range(len(batch) - 1):
             if batch[i]['ts'] >= d1_end_ts:
                 break
@@ -310,42 +250,70 @@ class BatchManager:
                 u = batch[i]
                 v = batch[j]
                 if u['src'] != v['src'] and self.compare(u['tgt'], v['tgt'], comparison):
-                    new_g.add_node(u['src'], label=u['src'])
-                    new_g.add_node(v['src'], label=v['src'])
+                    check_node(new_g, u['src'])  # new_g.add_node(u['src'], label=u['src'])
+                    check_node(new_g, v['src'])  # new_g.add_node(v['src'], label=v['src'])
                     if not new_g.has_edge(u['src'], v['src']):
                         # 'first' is to track the first co-activity acct
                         # including the timestamp will mean entries can be forgotten
                         new_g.add_edge(
                             u['src'], v['src'],
-                            weight=1.0,
+                            # weight=1.0,
                             first=[(u['src'], u['ts'])],
                             reasons=[(u['tgt'], u['ts'])]
                         )
                     else:
-                        new_g[u['src']][v['src']]['weight'] += 1.0
+                        # new_g[u['src']][v['src']]['weight'] += 1.0
                         new_g[u['src']][v['src']]['first'].append( (u['src'], u['ts']) )
                         new_g[u['src']][v['src']]['reasons'].append( (u['tgt'], u['ts']) )
             # no forgetting at the moment
         return new_g
 
-    def write_g(self, g, fn, dry_run):
-        if not dry_run:
+    def write_g(self, g, fn, dont_write_to_disk, verbose=False):
+        if not dont_write_to_disk:
+            tmp_g = g.copy()
             for u, v, d in g.edges(data=True):
-                g[u][v]['first'] = json.dumps(g[u][v]['first'])
-                g[u][v]['reasons'] = json.dumps(g[u][v]['reasons'])
-            nx.write_graphml(g, fn)
-            print('Wrote to', fn)
+                tmp_g[u][v]['weight'] = len(g[u][v]['reasons'])
+                tmp_g[u][v]['first'] = json.dumps(g[u][v]['first'])
+                tmp_g[u][v]['reasons'] = json.dumps(g[u][v]['reasons'])
+            nx.write_graphml(tmp_g, fn)
+            log(f'Wrote g (V={g.number_of_nodes()},E={g.number_of_edges()}) to {fn}', verbose)
 
+    # def process_batch(self, start_w_ts, queue, g):
+    def process_batch(self, end_w_ts, queue, g, d1_end_ts=None):
+        # set the window over which we're operating
+        start_w_ts = end_w_ts - self.cfg['d2']
+        if not d1_end_ts:
+            d1_end_ts = start_w_ts + self.cfg['d1']
 
-    def run(self, dry_run=False):
-        # if self.batch_mode:
-        #     batch_consumer = BatchConsumer()
-            #     d1=self.cfg['d1'], d2=self.cfg['d2'],
-            #     raw_data=self.raw_data
-            # )
+        # what's the time span of the queue?
+        log(f'Queue {len(queue)} events in {(queue[-1]["ts"] - queue[0]["ts"]) / (60):.1f} minutes')
+        for e in queue:
+            log(f'{ts_s(e["ts"])} {e["tgt"]}')
+
+        # only process the current window's worth, because the last event that
+        # occurred may have been way beyond the previous events
+        queue = self.drop_before(queue, start_w_ts)
+        log(f'-> Queue {len(queue)} events in {(queue[-1]["ts"] - queue[0]["ts"]) / (60):.1f} minutes')
+
+        # d1_end_ts = start_w_ts + self.cfg['d1']
+        if len(queue) >= 2:  # guard clause
+            g = self.process(queue, d1_end_ts, g)
+        queue = self.drop_before(queue, start_w_ts)  # drop t0 - d1 now
+
+        return (d1_end_ts, queue, g)
+
+    def mkfn(self, ts, final=False):
+        # return f'{self.cfg["out_filebase"]}-{self.cfg["extract_what"]}-{ts_s(start_w_ts + self.cfg["d2"])}.graphml'
+        final_str = '-FINAL' if final else ''
+        extract_what = f'-{self.cfg["extract_what"]}' if self.cfg["extract_what"] else ''
+        return f'{self.cfg["out_filebase"]}{extract_what}-{ts_s(ts)}{final_str}.graphml'
+
+    def run(self):
         if self.raw_data == 'TWEETS':
-            extractor = TweetExtractor(cfg['extract_what'])
-        detector = Detector(self.cfg['d1'], self.cfg['d2'])
+            extractor = TweetExtractor(self.cfg['extract_what'], self.cfg['exclude_targets'])
+        else:  # csv input
+            params = [self.cfg[k] for k in ['id_col', 'ts_col', 'src_col', 'tgt_col', 'exclude_targets']]
+            extractor = CsvExtractor(*params)
 
         in_f = None
         try:
@@ -359,63 +327,54 @@ class BatchManager:
             start_w_ts = -1
             line_count = 0
             for line in reader:
-                line_count += 1
-                if self.raw_data == 'TWEETS':
-                    extractions = extractor.extract(line)
-                    if len(extractions) == 0:
-                        continue
-                    if start_w_ts == -1:
-                        start_w_ts = extractions[0]['ts']
-                    curr_ts = extractions[0]['ts']
-                    if curr_ts > start_w_ts + self.cfg['d2']: # end of curr window
-                        # fn = cfg['out_filebase'] + '-' + utils.ts_to_str(utils.epoch_seconds_2_ts(start_w_ts + self.cfg['d2'])) + '.graphml'
-                        fn = cfg['out_filebase'] + '-' + utils.ts_to_str(start_w_ts + self.cfg['d2']) + '.graphml'
-                        start_w_ts += self.cfg['d1']
-                        g = self.process(queue, start_w_ts, g)
-                        write_g(g, fn, dry_run)
-                        queue = self.drop_before(queue, start_w_ts)
-                    # add the current extractions
-                    for e in extractions:
-                        queue.append(e)
-                    # map(queue.append, extractions)
-                    print(f'[{utils.ts_to_str(curr_ts)}] Queue size: {len(queue)}, lines read: {line_count}, extractions: {len(extractions)}')
+                line_count = utils.log_row_count(line_count, OVERRIDE)
 
-                else:
-                    row = line
-                    # assume CSV
-                    pass
+                extractions = extractor.extract(line)
+                if len(extractions) == 0:
+                    continue
 
-            # batch_consumer.start_processing(self.cfg['in_file'])
-            # print('Processing batch')
-            # batch = [0]
-            # while batch:
-            #     log('getting fresh batch')
-            #     batch = batch_consumer.get_next_batch()
-            #     log(f'Got fresh batch: {batch}')
-            #     if not batch: break
-            #     g = detector.process(batch, g)
+                if start_w_ts == -1:
+                    start_w_ts = extractions[0]['ts']
+                    log(f'First timestamp: {ts_s(start_w_ts)}')
+                curr_ts = extractions[0]['ts']
+
+                # look for the interaction (i.e. extract_what) if it hasn't been provided
+                if self.csv_mode and not self.cfg['extract_what'] and 'interaction' in line:
+                    self.cfg['extract_what'] = line['interaction']  # line is a csv row
+
+                if curr_ts > start_w_ts + self.cfg['d2']: # end of curr window
+                    # print('end of window')
+                    fn = self.mkfn(start_w_ts)
+                    d2_end_ts = start_w_ts + self.cfg['d2']
+                    start_w_ts, queue, g = self.process_batch(d2_end_ts, queue, g)
+                    self.write_g(g, fn, self.cfg['dry_run'] or self.cfg['final_g_only'])
+
+                # add the current extractions
+                for e in extractions:
+                    queue.append(e)
+
+                log(f'[{ts_s(curr_ts)}] Queue size: {len(queue)}, lines read: {line_count}, extractions: {len(extractions)}')
+
+            log('', OVERRIDE)
+
+            fn = self.mkfn(start_w_ts, final=True)
+            # use up the entire window, given we're at the end
+            last_ts = queue[-1]["ts"]
+            log(f'Last timestamp: {ts_s(last_ts)}')
+            start_w_ts, queue, g = self.process_batch(start_w_ts + self.cfg['d2'], queue, g, last_ts)
+            self.write_g(g, fn, self.cfg['dry_run'], OVERRIDE)
+
         finally:
             if in_f: in_f.close()
-            # batch_consumer.finish_processing()
 
 
 def parse_ts(ts_str):
     return utils.extract_ts_s(ts_str)
 
 
-def add_reason_node(g, r):
-    g.add_node(r, label=r, _node_type='REASON')
+def ts_s(epoch_seconds_ts):
+    return utils.ts_to_str(epoch_seconds_ts)
 
-
-def link_to_reason(g, n, r):
-    if not g.has_edge(n, r):
-        g.add_edge(n, r, weight=1.0, reason_weight=1.0, _edge_type='REASON')
-    else:
-        g[n][r]['weight'] += 1.0
-        if 'reason_weight' not in g[n][r]:
-            g[n][r]['reason_weight'] = 1.0
-        else:
-            g[n][r]['reason_weight'] += 1.0
 
 def convert_to_secs(t_str):
     if t_str[-1] in 'mM':
@@ -431,8 +390,9 @@ def convert_to_secs(t_str):
 
 
 DEBUG=False
-def log(msg):
-    if DEBUG: utils.eprint('[%s] %s' % (utils.now_str(), msg))
+OVERRIDE=True
+def log(msg, override=False):
+    if DEBUG or override: utils.eprint('[%s] %s' % (utils.now_str(), msg))
 
 
 if __name__=='__main__':
@@ -442,66 +402,34 @@ if __name__=='__main__':
 
     DEBUG=opts.verbose
 
-    STARTING_TIME = utils.now_str()
-    log('Starting\n')
+    start_time = time.time()
+    log('Starting', OVERRIDE)
 
     cfg = dict(
         in_file = opts.interactions_file,
         out_filebase = opts.out_filebase,
         d1 = convert_to_secs(opts.d1_arg),
         d2 = convert_to_secs(opts.d2_arg),
-        batch_mode = opts.process_mode == 'BATCH',
         raw_data = opts.raw_data,
-        extract_what = opts.extract_what
+        extract_what = opts.extract_what,
+        exclude_targets = list(map(lambda s: s.lower(), opts.exclude_targets.split('|'))),
+        dry_run = opts.dry_run,
+        final_g_only = opts.final_g_only,
+        id_col = opts.id_column,
+        ts_col = opts.timestamp_column,
+        src_col = opts.source_column,
+        tgt_col = opts.target_column,
     )
 
-    if cfg['d1'] >= cfg['d2']:
+    # default is for no sliding windows (i.e., adjacent windows)
+    if cfg['d2'] == -1:
+        cfg['d2'] = cfg['d1']
+
+    if cfg['d1'] > cfg['d2']:
         print(f'Delta 1 ({opts.d1_arg}) cannot be greater than delta 2 ({opts.d2_arg})')
-        sys.exit(1)
-
-    if opts.process_mode == 'BATCH':
+    else:
         mgr = BatchManager(cfg)
-        mgr.run(opts.dry_run)
+        mgr.run()
 
-
-
-    # d2_queue = []
-
-    # in_f = gzip.open(in_file, 'rb') if in_file[-1] in 'zZ' else open(in_file, encoding='utf-8')
-    # reader = csv.DictReader(in_f)
-    # line_count = 0
-    # for row in reader:
-    #     line_count += 1
-    #     if line_count % 10000:
-    #         log(f'read {line_count:10,} rows')
-
-
-    # g = nx.read_graphml(in_file)
-    #
-    # for n in g.nodes():
-    #     g.nodes[n]['_node_type'] = 'ACCOUNT'
-    #
-    # to_add = []
-    # for u, v, r_json in g.edges(data='reasons'):
-    #     reasons = json.loads(r_json)
-    #     for r in reasons:
-    #         to_add.append( (u, v, r) )
-    #
-    # for u, v, r in to_add:
-    #     if r not in g: add_reason_node(g, r)
-    #     else: g.nodes[r]['_node_type'] = 'REASON'
-    #         # g.add_node(r, label=r, _node_type='REASON')
-    #     link_to_reason(g, u, r)
-    #     link_to_reason(g, v, r)
-    #     # if not g.has_edge(u, r):
-    #     #     g.add_edge(u, r, weight=1.0, _edge_type='REASON')
-    #     # else:
-    #     #     g[u][r]['weight'] += 1.0
-    #     # if not g.has_edge(v, r):
-    #     #     g.add_edge(v, r, weight=1.0, _edge_type='REASON')
-    #     # else:
-    #     #     g[v][r]['weight'] += 1.0
-    #
-    # nx.write_graphml(g, out_file)
-
-    log('\nFinishing, having started at %s,' % STARTING_TIME)
+    duration = time.time() - start_time
+    log(f'DONE having started at {start_time}, having taken {duration:.1f} seconds', OVERRIDE)
