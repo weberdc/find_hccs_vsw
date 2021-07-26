@@ -326,6 +326,7 @@ class BatchManager:
             g = nx.Graph()
             start_w_ts = -1
             line_count = 0
+            definitely_no_interaction_column = False
             for line in reader:
                 line_count = utils.log_row_count(line_count, OVERRIDE)
 
@@ -339,8 +340,11 @@ class BatchManager:
                 curr_ts = extractions[0]['ts']
 
                 # look for the interaction (i.e. extract_what) if it hasn't been provided
-                if self.csv_mode and not self.cfg['extract_what'] and 'interaction' in line:
-                    self.cfg['extract_what'] = line['interaction']  # line is a csv row
+                if self.csv_mode and not definitely_no_interaction_column and not self.cfg['extract_what']:
+                    if 'interaction' in line:
+                        self.cfg['extract_what'] = line['interaction']  # line is a csv row
+                    else:
+                        definitely_no_interaction_column = True
 
                 if curr_ts > start_w_ts + self.cfg['d2']: # end of curr window
                     # print('end of window')
