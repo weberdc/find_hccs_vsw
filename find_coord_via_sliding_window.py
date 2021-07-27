@@ -5,11 +5,13 @@ import gzip
 import json
 import networkx as nx
 import re
+import regex
 import sys
 import time
 import utils
 
 from argparse import ArgumentParser
+from typing import Pattern
 
 # Searches timestamped interactions for coordination using a genuine sliding
 # window
@@ -54,6 +56,27 @@ class Options:
             help='Expect raw JSON data objects as input (default: None)'
         )
         self.parser.add_argument(
+            '-cmp', '--comparison-strategy',
+            dest='comparison_strategy',
+            choices=['EXACT_MATCH','CASE_INSENSITIVE', 'TEXT_SIMILARITY'],
+            default='EXACT_MATCH',
+            help='Comparison strategy to use (default: EXACT_MATCH)'
+        )
+        self.parser.add_argument(
+            '--text-similarity-threshold',
+            dest='text_similarity_threshold',
+            type=float,
+            default=0.9,
+            help='Threshold for a match [0,1] (default: 0.9)'
+        )
+        self.parser.add_argument(
+            '--text-similarity-min-tokens',
+            dest='text_similarity_min_tokens',
+            type=int,
+            default=5,
+            help='Minimum tokens to consider a text match (default: 5)'
+        )
+        self.parser.add_argument(
             '--extract',
             dest='extract_what',
             choices=Extractor.EXTRACTABLES,
@@ -89,6 +112,13 @@ class Options:
             default='',
             dest='exclude_targets',
             help='Target values to ignore, separated by | (default: "")'
+        )
+        self.parser.add_argument(
+            '--keep-history',
+            dest='keep_history',
+            action='store_true',
+            default=False,
+            help='Maintains lists of connecting reasons and order of co-activities, using a lot of memory (default: False)'
         )
         self.parser.add_argument(
             '--dry-run',
@@ -216,11 +246,75 @@ class TweetExtractor(Extractor):
         return extractions
 
 
+class Comparator:
+    def compare(self, x, y):
+        pass
+
+class ExactMatchComparator(Comparator):
+    def compare(self, x, y):
+        return x == y
+
+class CaseInsensitiveComparator(Comparator):
+    def compare(self, x, y):
+        return str(x).lower() == str(y).lower()
+
+class TextSimilarityComparator(Comparator):
+    def __init__(self, threshold=0.9, min_tokens=5):
+        self.threshold = threshold
+        self.min_tokens = min_tokens
+
+    def compare(self, str1, str2):
+        """
+        Method borrowed from https://github.com/QUT-Digital-Observatory/coordination-network-toolkit/blob/main/coordination_network_toolkit/similarity.py
+        """
+        word_tokeniser = regex.compile(
+            # Note this handles 'quoted' words a little weirdly: 'orange' is tokenised
+            # as ["orange", "'"] I'd prefer to tokenise this as ["'", "orange", "'"]
+            # but the regex library behaves weirdly. So for now phrase search for
+            # quoted strings won't work.
+            r"\b\p{Word_Break=WSegSpace}*'?",
+            flags=regex.WORD | regex.UNICODE | regex.V1,
+        )
+
+        def tokenise(text: str, tokenizer: Pattern = word_tokeniser) -> str:
+            # words = sorted(set(t for t in tokenizer.split(text.lower()) if t))
+            # tokenized = " ".join(words)
+            # return tokenized
+            return sorted(set(t for t in tokenizer.split(text.lower()) if t))
+
+        set1 = set(tokenise(str1))
+        if len(set1) < self.min_tokens:
+            return False  # 0
+
+        set2 = set(tokenise(str2))
+        if len(set2) < self.min_tokens:
+            return False  # 0
+
+        return len(set1 & set2) / len(set1 | set2) > self.threshold
+
+class Comparators:
+    def get_instance(comparison_strategy, **kwargs):
+        if comparison_strategy == 'CASE_INSENSITIVE':
+            return CaseInsensitiveComparator()
+        elif comparison_strategy == 'TEXT_SIMILARITY':
+            return TextSimilarityComparator(
+                kwargs['text_similarity_threshold'],
+                kwargs['text_similarity_min_tokens']
+            )
+        else:  # comparison_strategy == 'EXACT_MATCH'
+            return ExactMatchComparator()
+
+
+
 class BatchManager:
     def __init__(self, config):
         self.cfg = config
-        self.raw_data = config['raw_data']
-        self.csv_mode = self.raw_data == None
+        self.csv_mode = self.cfg['raw_data'] == None
+        self.comparator = Comparators.get_instance(
+            config['comparison_strategy'],
+            text_similarity_threshold = config['text_similarity_threshold'],
+            text_similarity_min_tokens = config['text_similarity_min_tokens']
+        )
 
     def open_file(self, in_file):
         if in_file[-1].lower() == 'z':  # assumes *.gz
@@ -231,13 +325,7 @@ class BatchManager:
     def drop_before(self, batch, cutoff_ts):
         return list(filter(lambda p: p['ts'] >= cutoff_ts, batch))
 
-    def compare(self, x, y, comparison_strategy):
-        if comparison_strategy == 'CASE_INSENSITIVE':
-            return str(x).lower() == str(y).lower()
-        else:  # comparison_strategy == 'EXACT_MATCH'
-            return x == y
-
-    def process(self, batch, d1_end_ts, old_g, comparison='EXACT'):
+    def process(self, batch, d1_end_ts, old_g, comparison='EXACT', keep_history=False):
         def check_node(g, n_id):
             if not g.has_node(n_id):
                 g.add_node(n_id, label=n_id)
@@ -249,36 +337,40 @@ class BatchManager:
             for j in range(i+1, len(batch)):
                 u = batch[i]
                 v = batch[j]
-                if u['src'] != v['src'] and self.compare(u['tgt'], v['tgt'], comparison):
-                    check_node(new_g, u['src'])  # new_g.add_node(u['src'], label=u['src'])
-                    check_node(new_g, v['src'])  # new_g.add_node(v['src'], label=v['src'])
+                if u['src'] != v['src'] and self.comparator.compare(u['tgt'], v['tgt']):
+                    check_node(new_g, u['src'])
+                    check_node(new_g, v['src'])
                     if not new_g.has_edge(u['src'], v['src']):
                         # 'first' is to track the first co-activity acct
                         # including the timestamp will mean entries can be forgotten
                         new_g.add_edge(
                             u['src'], v['src'],
-                            # weight=1.0,
-                            first=[(u['src'], u['ts'])],
-                            reasons=[(u['tgt'], u['ts'])]
+                            weight = 1.0,
+                            first_counts = { u['src'] : 1.0, v['src'] : 0.0 }
                         )
+                        if keep_history:
+                            new_g[u['src']][v['src']]['first'] = [(u['src'], u['ts'])]
+                            new_g[u['src']][v['src']]['reasons'] = [(u['tgt'], u['ts'])]
                     else:
-                        # new_g[u['src']][v['src']]['weight'] += 1.0
-                        new_g[u['src']][v['src']]['first'].append( (u['src'], u['ts']) )
-                        new_g[u['src']][v['src']]['reasons'].append( (u['tgt'], u['ts']) )
+                        new_g[u['src']][v['src']]['weight'] += 1.0
+                        new_g[u['src']][v['src']]['first_counts'][u['src']] += 1.0
+                        if keep_history:
+                            new_g[u['src']][v['src']]['first'].append( (u['src'], u['ts']) )
+                            new_g[u['src']][v['src']]['reasons'].append( (u['tgt'], u['ts']) )
             # no forgetting at the moment
         return new_g
 
-    def write_g(self, g, fn, dont_write_to_disk, verbose=False):
+    def write_g(self, g, fn, dont_write_to_disk, verbose=False, keep_history=False):
         if not dont_write_to_disk:
             tmp_g = g.copy()
             for u, v, d in g.edges(data=True):
-                tmp_g[u][v]['weight'] = len(g[u][v]['reasons'])
-                tmp_g[u][v]['first'] = json.dumps(g[u][v]['first'])
-                tmp_g[u][v]['reasons'] = json.dumps(g[u][v]['reasons'])
+                tmp_g[u][v]['first_counts'] = json.dumps(tmp_g[u][v]['first_counts'])
+                if keep_history:
+                    tmp_g[u][v]['first'] = json.dumps(g[u][v]['first'])
+                    tmp_g[u][v]['reasons'] = json.dumps(g[u][v]['reasons'])
             nx.write_graphml(tmp_g, fn)
             log(f'Wrote g (V={g.number_of_nodes()},E={g.number_of_edges()}) to {fn}', verbose)
 
-    # def process_batch(self, start_w_ts, queue, g):
     def process_batch(self, end_w_ts, queue, g, d1_end_ts=None):
         # set the window over which we're operating
         start_w_ts = end_w_ts - self.cfg['d2']
@@ -295,21 +387,19 @@ class BatchManager:
         queue = self.drop_before(queue, start_w_ts)
         log(f'-> Queue {len(queue)} events in {(queue[-1]["ts"] - queue[0]["ts"]) / (60):.1f} minutes')
 
-        # d1_end_ts = start_w_ts + self.cfg['d1']
         if len(queue) >= 2:  # guard clause
-            g = self.process(queue, d1_end_ts, g)
+            g = self.process(queue, d1_end_ts, g, self.cfg['comparison_strategy'], self.cfg['keep_history'])
         queue = self.drop_before(queue, start_w_ts)  # drop t0 - d1 now
 
         return (d1_end_ts, queue, g)
 
     def mkfn(self, ts, final=False):
-        # return f'{self.cfg["out_filebase"]}-{self.cfg["extract_what"]}-{ts_s(start_w_ts + self.cfg["d2"])}.graphml'
-        final_str = '-FINAL' if final else ''
+        tag = 'FINAL' if final else f'{ts_s(ts)}'
         extract_what = f'-{self.cfg["extract_what"]}' if self.cfg["extract_what"] else ''
-        return f'{self.cfg["out_filebase"]}{extract_what}-{ts_s(ts)}{final_str}.graphml'
+        return f'{self.cfg["out_filebase"]}{extract_what}-{tag}.graphml'
 
     def run(self):
-        if self.raw_data == 'TWEETS':
+        if self.cfg['raw_data'] == 'TWEETS':
             extractor = TweetExtractor(self.cfg['extract_what'], self.cfg['exclude_targets'])
         else:  # csv input
             params = [self.cfg[k] for k in ['id_col', 'ts_col', 'src_col', 'tgt_col', 'exclude_targets']]
@@ -326,7 +416,7 @@ class BatchManager:
             g = nx.Graph()
             start_w_ts = -1
             line_count = 0
-            definitely_no_interaction_column = False
+            definitely_no_interaction_column = False  # used to short circuit further tests
             for line in reader:
                 line_count = utils.log_row_count(line_count, OVERRIDE)
 
@@ -351,7 +441,7 @@ class BatchManager:
                     fn = self.mkfn(start_w_ts)
                     d2_end_ts = start_w_ts + self.cfg['d2']
                     start_w_ts, queue, g = self.process_batch(d2_end_ts, queue, g)
-                    self.write_g(g, fn, self.cfg['dry_run'] or self.cfg['final_g_only'])
+                    self.write_g(g, fn, self.cfg['dry_run'] or self.cfg['final_g_only'], keep_history=self.cfg['keep_history'])
 
                 # add the current extractions
                 for e in extractions:
@@ -359,14 +449,14 @@ class BatchManager:
 
                 log(f'[{ts_s(curr_ts)}] Queue size: {len(queue)}, lines read: {line_count}, extractions: {len(extractions)}')
 
-            log('', OVERRIDE)
+            log('\n', OVERRIDE)
 
             fn = self.mkfn(start_w_ts, final=True)
             # use up the entire window, given we're at the end
             last_ts = queue[-1]["ts"]
             log(f'Last timestamp: {ts_s(last_ts)}')
             start_w_ts, queue, g = self.process_batch(start_w_ts + self.cfg['d2'], queue, g, last_ts)
-            self.write_g(g, fn, self.cfg['dry_run'], OVERRIDE)
+            self.write_g(g, fn, self.cfg['dry_run'], keep_history=self.cfg['keep_history'], verbose=OVERRIDE)
 
         finally:
             if in_f: in_f.close()
@@ -423,6 +513,10 @@ if __name__=='__main__':
         ts_col = opts.timestamp_column,
         src_col = opts.source_column,
         tgt_col = opts.target_column,
+        keep_history = opts.keep_history,
+        comparison_strategy = opts.comparison_strategy,
+        text_similarity_threshold = opts.text_similarity_threshold,
+        text_similarity_min_tokens = opts.text_similarity_min_tokens
     )
 
     # default is for no sliding windows (i.e., adjacent windows)
