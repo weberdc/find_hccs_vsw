@@ -135,6 +135,13 @@ class Options:
             help='Will only write out final combined CN (default: False)'
         )
         self.parser.add_argument(
+            '--final-g-min-ew',
+            dest='final_g_min_edge_weight',
+            type=float,
+            default=-1.0,
+            help='Filters the CN edge weights before writing to disk (default: -1)'
+        )
+        self.parser.add_argument(
             '-v', '--verbose',
             dest='verbose',
             action='store_true',
@@ -250,13 +257,16 @@ class Comparator:
     def compare(self, x, y):
         pass
 
+
 class ExactMatchComparator(Comparator):
     def compare(self, x, y):
         return x == y
 
+
 class CaseInsensitiveComparator(Comparator):
     def compare(self, x, y):
         return str(x).lower() == str(y).lower()
+
 
 class TextSimilarityComparator(Comparator):
     def __init__(self, threshold=0.9, min_tokens=5):
@@ -291,6 +301,7 @@ class TextSimilarityComparator(Comparator):
             return False  # 0
 
         return len(set1 & set2) / len(set1 | set2) > self.threshold
+
 
 class Comparators:
     def get_instance(comparison_strategy, **kwargs):
@@ -349,14 +360,22 @@ class BatchManager:
                             first_counts = { u['src'] : 1.0, v['src'] : 0.0 }
                         )
                         if keep_history:
-                            new_g[u['src']][v['src']]['first'] = [(u['src'], u['ts'])]
-                            new_g[u['src']][v['src']]['reasons'] = [(u['tgt'], u['ts'])]
+                            new_g[u['src']][v['src']]['first'] = [{
+                                'src': u['src'], 'ts': u['ts'], 't_id': u['t_id']
+                            }]
+                            new_g[u['src']][v['src']]['reasons'] = [{
+                                'tgt': u['tgt'], 'ts': u['ts'], 'ut_id': u['t_id'], 'vt_id': v['t_id']
+                            }]
                     else:
                         new_g[u['src']][v['src']]['weight'] += 1.0
                         new_g[u['src']][v['src']]['first_counts'][u['src']] += 1.0
                         if keep_history:
-                            new_g[u['src']][v['src']]['first'].append( (u['src'], u['ts']) )
-                            new_g[u['src']][v['src']]['reasons'].append( (u['tgt'], u['ts']) )
+                            new_g[u['src']][v['src']]['first'].append({
+                                'src': u['src'], 'ts': u['ts'], 't_id': u['t_id']
+                            })
+                            new_g[u['src']][v['src']]['reasons'].append({
+                                'tgt': u['tgt'], 'ts': u['ts'], 'ut_id': u['t_id'], 'vt_id': v['t_id']
+                            })
             # no forgetting at the moment
         return new_g
 
@@ -379,8 +398,8 @@ class BatchManager:
 
         # what's the time span of the queue?
         log(f'Queue {len(queue)} events in {(queue[-1]["ts"] - queue[0]["ts"]) / (60):.1f} minutes')
-        for e in queue:
-            log(f'{ts_s(e["ts"])} {e["tgt"]}')
+        # for e in queue:
+        #     log(f'{ts_s(e["ts"])} {e["tgt"]}')
 
         # only process the current window's worth, because the last event that
         # occurred may have been way beyond the previous events
@@ -392,6 +411,21 @@ class BatchManager:
         queue = self.drop_before(queue, start_w_ts)  # drop t0 - d1 now
 
         return (d1_end_ts, queue, g)
+
+    def filter_edges(self, g, min_ew):
+        if min_ew < 0:
+            return g
+
+        for u, v, _ in [
+            (u, v, w) for u, v, w in g.edges(data='weight') if w < min_ew
+        ]:
+            g.remove_edge(u, v)
+
+        for n, _ in [(n, d) for n, d in g.degree() if d == 0 ]:
+            g.remove_node(n)
+
+        return g
+
 
     def mkfn(self, ts, final=False):
         tag = 'FINAL' if final else f'{ts_s(ts)}'
@@ -456,7 +490,7 @@ class BatchManager:
             last_ts = queue[-1]["ts"]
             log(f'Last timestamp: {ts_s(last_ts)}')
             start_w_ts, queue, g = self.process_batch(start_w_ts + self.cfg['d2'], queue, g, last_ts)
-            self.write_g(g, fn, self.cfg['dry_run'], keep_history=self.cfg['keep_history'], verbose=OVERRIDE)
+            self.write_g(self.filter_edges(g, self.cfg['final_g_min_edge_weight']), fn, self.cfg['dry_run'], keep_history=self.cfg['keep_history'], verbose=OVERRIDE)
 
         finally:
             if in_f: in_f.close()
@@ -509,6 +543,7 @@ if __name__=='__main__':
         exclude_targets = list(map(lambda s: s.lower(), opts.exclude_targets.split('|'))),
         dry_run = opts.dry_run,
         final_g_only = opts.final_g_only,
+        final_g_min_edge_weight = opts.final_g_min_edge_weight,
         id_col = opts.id_column,
         ts_col = opts.timestamp_column,
         src_col = opts.source_column,
