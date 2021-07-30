@@ -6,6 +6,7 @@ import json
 import networkx as nx
 import re
 import regex
+import statistics
 import sys
 import time
 import utils
@@ -255,17 +256,18 @@ class TweetExtractor(Extractor):
 
 class Comparator:
     def compare(self, x, y):
+        # return comparison strength: 0 for different, > 0 for similar (1 for same)
         pass
 
 
 class ExactMatchComparator(Comparator):
     def compare(self, x, y):
-        return x == y
+        return 1 if x == y else 0
 
 
 class CaseInsensitiveComparator(Comparator):
     def compare(self, x, y):
-        return str(x).lower() == str(y).lower()
+        return 1 if str(x).lower() == str(y).lower() else 0
 
 
 class TextSimilarityComparator(Comparator):
@@ -300,7 +302,11 @@ class TextSimilarityComparator(Comparator):
         if len(set2) < self.min_tokens:
             return False  # 0
 
-        return len(set1 & set2) / len(set1 | set2) > self.threshold
+        comparison = len(set1 & set2) / len(set1 | set2)
+        if comparison > self.threshold:
+            return comparison
+        else:
+            return 0  # treat as _entirely_ dissimilar
 
 
 class Comparators:
@@ -341,14 +347,15 @@ class BatchManager:
             if not g.has_node(n_id):
                 g.add_node(n_id, label=n_id)
 
-        new_g = old_g.copy() if not self.cfg['final_g_only'] else old_g
+        new_g = old_g.copy() if not (self.cfg['final_g_only'] or self.cfg['dry_run']) else old_g
         for i in range(len(batch) - 1):
             if batch[i]['ts'] >= d1_end_ts:
                 break
             for j in range(i+1, len(batch)):
                 u = batch[i]
                 v = batch[j]
-                if u['src'] != v['src'] and self.comparator.compare(u['tgt'], v['tgt']):
+                comparison_strength = self.comparator.compare(u['tgt'], v['tgt'])
+                if u['src'] != v['src'] and comparison_strength > 0:
                     check_node(new_g, u['src'])
                     check_node(new_g, v['src'])
                     if not new_g.has_edge(u['src'], v['src']):
@@ -356,7 +363,7 @@ class BatchManager:
                         # including the timestamp will mean entries can be forgotten
                         new_g.add_edge(
                             u['src'], v['src'],
-                            weight = 1.0,
+                            weight = comparison_strength,
                             first_counts = { u['src'] : 1.0, v['src'] : 0.0 }
                         )
                         if keep_history:
@@ -367,7 +374,7 @@ class BatchManager:
                                 'tgt': u['tgt'], 'ts': u['ts'], 'ut_id': u['t_id'], 'vt_id': v['t_id']
                             }]
                     else:
-                        new_g[u['src']][v['src']]['weight'] += 1.0
+                        new_g[u['src']][v['src']]['weight'] += comparison_strength
                         new_g[u['src']][v['src']]['first_counts'][u['src']] += 1.0
                         if keep_history:
                             new_g[u['src']][v['src']]['first'].append({
@@ -382,13 +389,20 @@ class BatchManager:
     def write_g(self, g, fn, dont_write_to_disk, verbose=False, keep_history=False):
         if not dont_write_to_disk:
             tmp_g = g.copy()
+            # calc average 'first_count' for each node
+            for n, n_id in g.nodes(data='label'):
+                # get adjacent edges and their data
+                tmp_g.nodes[n]['first_proportion'] = statistics.mean(
+                    edge_data['first_counts'][n_id] for _, edge_data in g[n].items()
+                )
+            # flatten complex structures to JSON
             for u, v, d in g.edges(data=True):
                 tmp_g[u][v]['first_counts'] = json.dumps(tmp_g[u][v]['first_counts'])
                 if keep_history:
                     tmp_g[u][v]['first'] = json.dumps(g[u][v]['first'])
                     tmp_g[u][v]['reasons'] = json.dumps(g[u][v]['reasons'])
             nx.write_graphml(tmp_g, fn)
-            log(f'Wrote g (V={g.number_of_nodes()},E={g.number_of_edges()}) to {fn}', verbose)
+            log(f'Wrote g (V={g.number_of_nodes():,},E={g.number_of_edges():,}) to {fn}', verbose)
 
     def process_batch(self, end_w_ts, queue, g, d1_end_ts=None):
         # set the window over which we're operating
@@ -565,4 +579,4 @@ if __name__=='__main__':
         mgr.run()
 
     duration = time.time() - start_time
-    log(f'DONE having started at {start_time}, having taken {duration:.1f} seconds', OVERRIDE)
+    log(f'DONE having taken {duration:.1f} seconds', OVERRIDE)
