@@ -4,7 +4,49 @@ import json
 import sys
 import time
 
+from argparse import ArgumentParser
 from datetime import datetime
+
+
+class Options:
+    def __init__(self):
+        self._init_parser()
+
+    def _init_parser(self):
+        usage = 'extract_retweets_as_csv.py -i <tweets>.json -o <retweets>.csv [--format TWITTER|GNIP]'
+
+        self.parser = ArgumentParser(usage=usage)
+        self.parser.add_argument(
+            '-i',
+            required=True,
+            dest='in_file',
+            help='A file of tweets'
+        )
+        self.parser.add_argument(
+            '-o',
+            required=False,
+            default=None,
+            dest='out_file',
+            help='Retweets as CSV (a selection of fields)'
+        )
+        self.parser.add_argument(
+            '-f', '--format',
+            required=False,
+            default='TWITTER',
+            choices=['TWITTER', 'GNIP'],
+            dest='tweet_format',
+            help='Format of tweets, TWITTER or GNIP (default TWITTER)'
+        )
+        self.parser.add_argument(
+            '-v', '--verbose',
+            dest='verbose',
+            action='store_true',
+            default=False,
+            help='Verbose logging (default: False)'
+        )
+
+    def parse(self, args=None):
+        return self.parser.parse_args(args)
 
 
 def extract_text(tweet):
@@ -47,10 +89,10 @@ def make_csv_safe(str_with_newlines):
     return str_with_newlines.replace('\n', '\\n')
 
 
-def is_rt(t, gnip_format):
-    if gnip_format:
+def is_rt(t, tweet_format):
+    if tweet_format == 'GNIP':
         return t['verb'] == 'share'
-    else:  # standard twitter format
+    else:  # tweet_format == 'TWITTER', i.e., standard twitter format
         return 'retweeted_status' in t and t['retweeted_status'] != None
 
 
@@ -58,9 +100,9 @@ def extract_gnip_id(str):
     return str[str.rindex(':')+1:]
 
 
-def extract_row(t, is_gnip):
+def extract_row(t, tweet_format):
     rt = t  # the retweet
-    if is_gnip:
+    if tweet_format == 'GNIP':
         ot = t['object']  # the original tweet
         return {
             'retweetid'       : extract_gnip_id(rt['id']), # e.g. "tag:search.twitter.com,2005:924800252065980416"
@@ -70,7 +112,7 @@ def extract_row(t, is_gnip):
             'retweet text'    : make_csv_safe(rt['body']), #extract_text(rt),  # RT @orig: what orig said...
             'timestamp'       : parse_ts(rt['postedTime'], fmt=GNIP_TS_FORMAT)  # epoch seconds, e.g. "2017-10-30T00:48:56.000Z"
         }
-    else:
+    else:  # tweet_format == 'TWITTER'
         ot = t['retweeted_status']  # the original tweet
         return {
             'retweetid'       : rt['id_str'],
@@ -84,12 +126,12 @@ def extract_row(t, is_gnip):
 
 if __name__=='__main__':
 
-    if len(sys.argv) < 3:
-        print('Usage: python this_script.py <input tweets>.json <extracted retweets>.csv [TWITTER|GNIP]')
+    options = Options()
+    opts = options.parse(sys.argv[1:])
 
-    in_file = sys.argv[1]
-    out_file = sys.argv[2]
-    is_gnip = False if len(sys.argv) < 4 else sys.argv[3].lower() == 'gnip'
+    in_file = opts.in_file
+    out_file = opts.out_file
+    tweet_format = opts.tweet_format
     print(f'Reading {in_file} and writing to {out_file}')
 
     with open(in_file, 'r', encoding='utf-8') as in_f:
@@ -103,5 +145,5 @@ if __name__=='__main__':
             writer.writeheader()
             for l in in_f:
                 t = json.loads(l)
-                if is_rt(t, is_gnip):
-                    writer.writerow(extract_row(t, is_gnip))
+                if is_rt(t, tweet_format):
+                    writer.writerow(extract_row(t, tweet_format))
