@@ -37,13 +37,6 @@ class Options:
             dest='tweet_format',
             help='Format of tweets, TWITTER or GNIP (default TWITTER)'
         )
-        self.parser.add_argument(
-            '-v', '--verbose',
-            dest='verbose',
-            action='store_true',
-            default=False,
-            help='Verbose logging (default: False)'
-        )
 
     def parse(self, args=None):
         return self.parser.parse_args(args)
