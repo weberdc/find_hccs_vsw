@@ -42,10 +42,7 @@ if __name__=='__main__':
     ).split(',')
 
     components = list(nx.connected_components(g))
-    # print('Component count:%d' % len(components))
-    # lgst = len(list(sorted(components, key=len, reverse=True))[0]) if len(components) else 0
-    lc = g.subgraph(max(components, key=len))#.to_undirected())
-    # lgst = len(max(components, key=len))
+    lc = g.subgraph(max(components, key=len))
 
     ew_mean, ew_stdev = mew(g)
     lc_ew_mean, lc_ew_stdev = mew(lc)
