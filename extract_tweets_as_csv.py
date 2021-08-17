@@ -13,7 +13,7 @@ class Options:
         self._init_parser()
 
     def _init_parser(self):
-        usage = 'extract_retweets_as_csv.py -i <tweets>.json -o <retweets>.csv [--format TWITTER|GNIP]'
+        usage = 'extract_retweets_as_csv.py -i <tweets>.json -o <retweets>.csv [--format TWITTER|RAPID]'
 
         self.parser = ArgumentParser(usage=usage)
         self.parser.add_argument(
@@ -33,7 +33,7 @@ class Options:
             '-f', '--format',
             required=False,
             default='TWITTER',
-            choices=['TWITTER', 'GNIP'],
+            choices=['TWITTER', 'RAPID'], # 'GNIP',
             dest='tweet_format',
             help='Format of tweets, TWITTER or GNIP (default TWITTER)'
         )
@@ -168,7 +168,11 @@ if __name__=='__main__':
             writer = csv.DictWriter(out_f, fieldnames=cols)
 
             writer.writeheader()
-            for l in in_f:
-                t = json.loads(l)
-                # if is_rt(t, tweet_format):
-                writer.writerow(extract_row(t, tweet_format))
+            if tweet_format == 'RAPID':
+                tweets = json.loads(in_f.read())  # can't be too big!
+                for t in tweets:
+                    writer.writerow(extract_row(t, tweet_format))
+            else:
+                for l in in_f:
+                    t = json.loads(l)
+                    writer.writerow(extract_row(t, tweet_format))
